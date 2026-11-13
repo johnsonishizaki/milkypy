@@ -468,7 +468,7 @@ async function callCloudflareAi(
 
   if (errors.length === 0) {
     const err: any = new Error(
-      "AI API key is not configured in Cloudflare Pages. Add DEEPSEEK_API_KEY (or GEMINI_API_KEY / GROQ_API_KEY) in Cloudflare Pages -> Settings -> Variables and Secrets, then redeploy."
+      "AI API key is not configured in Cloudflare Workers. Add DEEPSEEK_API_KEY (or GEMINI_API_KEY / GROQ_API_KEY) via Cloudflare Workers dashboard -> Settings -> Variables and Secrets or wrangler secret put, then redeploy."
     );
     err.missingApiKey = true;
     throw err;

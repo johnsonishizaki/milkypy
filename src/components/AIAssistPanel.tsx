@@ -639,6 +639,26 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
           </button>
         </div>
 
+        {/* Active Curriculum Lesson Context Banner */}
+        {lessonContext?.title && (
+          <div className="bg-blue-50 dark:bg-blue-950/40 border-b border-blue-200 dark:border-blue-800/60 px-3.5 py-2.5 space-y-1">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-bold text-blue-700 dark:text-blue-300 flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-blue-500" />
+                Current Lesson: {lessonContext.title}
+              </span>
+              <span className="text-[10px] bg-blue-100 dark:bg-blue-900/60 text-blue-800 dark:text-blue-200 px-1.5 py-0.5 rounded font-mono font-semibold">
+                Curriculum Mode
+              </span>
+            </div>
+            {lessonContext.description && (
+              <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-normal">
+                {lessonContext.description}
+              </p>
+            )}
+          </div>
+        )}
+
         {/* Main Content Area */}
         <div className="flex-1 p-4 overflow-y-auto space-y-4">
           {errorText && (
@@ -863,21 +883,29 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
                     {chatMessages.length === 0 ? (
                       <div className="text-center text-slate-500 dark:text-slate-400 text-xs py-6 space-y-4">
                         <div>
-                          <MessageCircle className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                          <MessageCircle className="w-8 h-8 mx-auto mb-2 opacity-50 text-blue-500" />
                           <p className="font-semibold text-slate-700 dark:text-slate-200">
-                            Ask me anything, from Python lessons to everyday questions
+                            {lessonContext?.title ? `Ready to master "${lessonContext.title}"?` : "Ask me anything, from Python lessons to everyday questions"}
                           </p>
                           <p className="text-[11px] text-slate-400 mt-1">
-                            I know the full MilkyPy curriculum and can teach, debug, or chat normally.
+                            {lessonContext?.title ? "I can guide you through the lesson objectives, explain the code, or review your work." : "I know the full MilkyPy curriculum and can teach, debug, or chat normally."}
                           </p>
                         </div>
                         <div className="flex flex-wrap justify-center gap-2 px-2">
-                          {[
-                            "Teach me a lesson from the Python curriculum",
-                            "Explain what this code does step-by-step",
-                            "Find any bugs or edge cases in my code",
-                            "What should I learn next in Python?",
-                          ].map((starter) => (
+                          {(lessonContext?.title
+                            ? [
+                                `Walk me through the objectives of "${lessonContext.title}"`,
+                                "How do I write the code for this lesson exercise?",
+                                "Check my current editor code against lesson goals",
+                                "Give me a simple step-by-step breakdown",
+                              ]
+                            : [
+                                "Teach me a lesson from the Python curriculum",
+                                "Explain what this code does step-by-step",
+                                "Find any bugs or edge cases in my code",
+                                "What should I learn next in Python?",
+                              ]
+                          ).map((starter) => (
                             <button
                               key={starter}
                               type="button"
