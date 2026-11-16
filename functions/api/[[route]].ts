@@ -68,21 +68,35 @@ function cleanAndParseJson(text: string): any {
   }
 }
 
+function clampText(val: unknown, maxChars: number): string {
+  const s = typeof val === "string" ? val.trim() : String(val ?? "").trim();
+  if (!s || s.length <= maxChars) return s;
+  return `${s.slice(0, maxChars)}\n... (truncated)`;
+}
+
+function clampMessages(
+  messages?: Array<{ role: string; text: string }>
+): Array<{ role: "user" | "model"; text: string }> {
+  const recent = (messages || []).slice(-6);
+  return recent
+    .map((m, idx) => {
+      const isLast = idx === recent.length - 1;
+      const text = clampText(m?.text || "", isLast ? 1200 : 750);
+      return {
+        role: (m?.role === "assistant" || m?.role === "model" ? "model" : "user") as "user" | "model",
+        text,
+      };
+    })
+    .filter((m) => m.text.length > 0);
+}
+
 function normalizeGeminiContentsEdge(
   messages?: Array<{ role: string; text: string }>,
   prompt?: string
 ): Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> {
-  const raw: Array<{ role: "user" | "model"; text: string }> = [];
-  for (const m of (messages || []).slice(-14)) {
-    const text = (m?.text || "").trim();
-    if (!text) continue;
-    raw.push({
-      role: m.role === "assistant" || m.role === "model" ? "model" : "user",
-      text,
-    });
-  }
+  const raw = clampMessages(messages);
   if (prompt && prompt.trim()) {
-    raw.push({ role: "user", text: prompt.trim() });
+    raw.push({ role: "user", text: clampText(prompt, 3800) });
   }
   while (raw.length > 0 && raw[0].role !== "user") {
     raw.shift();
@@ -244,8 +258,102 @@ async function fsQueryFilesByUser(userId: string): Promise<any[]> {
 }
 
 // =====================================================================
-// Edge AI Providers (DeepSeek primary + Gemini & Groq fallback)
+// Edge AI Cache, Per-IP Rate Limiter & Providers
 // =====================================================================
+
+const EDGE_AI_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const isolateAiCache = new Map<string, { data: any; timestamp: number }>();
+const isolateRateLimits = new Map<string, { shortWindow: number[]; hourWindow: number[] }>();
+
+async function sha256Hex(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function getEdgeCacheApi(): Cache | null {
+  try {
+    const c = (globalThis as any).caches;
+    return c && c.default ? (c.default as Cache) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readEdgeAiCache(cacheHash: string): Promise<any | null> {
+  const mem = isolateAiCache.get(cacheHash);
+  if (mem && Date.now() - mem.timestamp < EDGE_AI_CACHE_TTL_MS) {
+    return mem.data;
+  }
+  const cacheApi = getEdgeCacheApi();
+  if (!cacheApi) return null;
+  try {
+    const res = await cacheApi.match(`https://ai-cache.milkypy.internal/${cacheHash}`);
+    if (res && res.ok) {
+      const data = await res.json();
+      isolateAiCache.set(cacheHash, { data, timestamp: Date.now() });
+      return data;
+    }
+  } catch {
+    // Ignore Cache API errors
+  }
+  return null;
+}
+
+async function writeEdgeAiCache(cacheHash: string, data: any): Promise<void> {
+  if (isolateAiCache.size > 250) {
+    const firstKey = isolateAiCache.keys().next().value;
+    if (firstKey) isolateAiCache.delete(firstKey);
+  }
+  isolateAiCache.set(cacheHash, { data, timestamp: Date.now() });
+  const cacheApi = getEdgeCacheApi();
+  if (!cacheApi) return;
+  try {
+    const res = new Response(JSON.stringify(data), {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "public, max-age=86400",
+      },
+    });
+    await cacheApi.put(`https://ai-cache.milkypy.internal/${cacheHash}`, res);
+  } catch {
+    // Ignore Cache API errors
+  }
+}
+
+function checkEdgeRateLimit(request: Request): { allowed: boolean; retryAfterSec?: number } {
+  const ip =
+    request.headers.get("cf-connecting-ip") ||
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    "anonymous";
+  const now = Date.now();
+  const tenMinAgo = now - 10 * 60 * 1000;
+  const oneHourAgo = now - 60 * 60 * 1000;
+
+  const entry = isolateRateLimits.get(ip) || { shortWindow: [], hourWindow: [] };
+  entry.shortWindow = entry.shortWindow.filter((t) => t > tenMinAgo);
+  entry.hourWindow = entry.hourWindow.filter((t) => t > oneHourAgo);
+
+  if (entry.shortWindow.length >= 15) {
+    isolateRateLimits.set(ip, entry);
+    return { allowed: false, retryAfterSec: 120 };
+  }
+  if (entry.hourWindow.length >= 40) {
+    isolateRateLimits.set(ip, entry);
+    return { allowed: false, retryAfterSec: 600 };
+  }
+
+  entry.shortWindow.push(now);
+  entry.hourWindow.push(now);
+  if (isolateRateLimits.size > 500) {
+    const firstIp = isolateRateLimits.keys().next().value;
+    if (firstIp) isolateRateLimits.delete(firstIp);
+  }
+  isolateRateLimits.set(ip, entry);
+  return { allowed: true };
+}
 
 async function callGeminiEdge(options: {
   apiKey: string;
@@ -271,12 +379,13 @@ async function callGeminiEdge(options: {
         contents,
         generationConfig: {
           thinkingConfig: { thinkingLevel: candidate.thinkingLevel },
+          maxOutputTokens: Math.min(options.maxTokens || 900, 1400),
           ...(options.responseType === "json" ? { responseMimeType: "application/json" } : {}),
         },
       };
 
       if (options.systemInstruction) {
-        body.systemInstruction = { parts: [{ text: options.systemInstruction }] };
+        body.systemInstruction = { parts: [{ text: clampText(options.systemInstruction, 4500) }] };
       }
 
       const resp = await fetch(
@@ -342,7 +451,7 @@ async function callOpenAiEdge(options: {
   maxTokens?: number;
 }): Promise<any> {
   const formattedMessages: Array<{ role: string; content: string }> = [];
-  let systemContent = options.systemInstruction || "";
+  let systemContent = clampText(options.systemInstruction || "", 4500);
   if (
     options.responseType === "json" &&
     !systemContent.toLowerCase().includes("json") &&
@@ -353,18 +462,15 @@ async function callOpenAiEdge(options: {
   if (systemContent) {
     formattedMessages.push({ role: "system", content: systemContent });
   }
-  if (options.messages && options.messages.length > 0) {
-    for (const m of options.messages.slice(-14)) {
-      const text = (m.text || "").trim();
-      if (!text) continue;
-      formattedMessages.push({
-        role: m.role === "model" || m.role === "assistant" ? "assistant" : "user",
-        content: text,
-      });
-    }
+  const clampedHistory = clampMessages(options.messages);
+  for (const m of clampedHistory) {
+    formattedMessages.push({
+      role: m.role === "model" ? "assistant" : "user",
+      content: m.text,
+    });
   }
   if (options.prompt && options.prompt.trim()) {
-    formattedMessages.push({ role: "user", content: options.prompt.trim() });
+    formattedMessages.push({ role: "user", content: clampText(options.prompt, 3800) });
   }
   if (formattedMessages.length === 0) {
     formattedMessages.push({ role: "user", content: "Hello" });
@@ -373,8 +479,8 @@ async function callOpenAiEdge(options: {
   const payload: any = {
     model: options.model,
     messages: formattedMessages,
-    temperature: 0.35,
-    max_tokens: Math.min(options.maxTokens || 4096, 8192),
+    temperature: 0.3,
+    max_tokens: Math.min(options.maxTokens || 900, 1400),
   };
   if (options.responseType === "json") {
     payload.response_format = { type: "json_object" };
@@ -413,9 +519,22 @@ async function callOpenAiEdge(options: {
   return { text: content };
 }
 
+function getProviderOrder(env: Record<string, string | undefined>): Array<"gemini" | "groq" | "deepseek"> {
+  const preferred = (env.AI_PRIMARY_PROVIDER || "").trim().toLowerCase();
+  if (preferred === "deepseek") {
+    return ["deepseek", "gemini", "groq"];
+  }
+  if (preferred === "groq") {
+    return ["groq", "gemini", "deepseek"];
+  }
+  // Free-tier providers first by default so DeepSeek credits are protected
+  return ["gemini", "groq", "deepseek"];
+}
+
 async function callCloudflareAi(
   env: Record<string, string | undefined>,
   options: {
+    cachePrefix: string;
     systemInstruction?: string;
     prompt: string;
     messages?: Array<{ role: string; text: string }>;
@@ -423,52 +542,70 @@ async function callCloudflareAi(
     maxTokens?: number;
   }
 ): Promise<any> {
+  if ((env.DISABLE_CLOUD_AI || "").trim().toLowerCase() === "true") {
+    const err: any = new Error("Cloud AI is paused via DISABLE_CLOUD_AI — using built-in offline guide.");
+    err.missingApiKey = true;
+    throw err;
+  }
+
+  const normalizedHistory = clampMessages(options.messages)
+    .map((m) => `${m.role}:${m.text}`)
+    .join("|");
+  const cacheSeed = `${options.cachePrefix}|${clampText(options.systemInstruction || "", 4500)}|${clampText(
+    options.prompt,
+    3800
+  )}|${normalizedHistory}`;
+  const cacheHash = await sha256Hex(cacheSeed);
+
+  const cached = await readEdgeAiCache(cacheHash);
+  if (cached) {
+    return { ...cached, _fromCache: true };
+  }
+
   const deepseekKey = (env.DEEPSEEK_API_KEY || "").trim();
   const geminiKey = (env.GEMINI_API_KEY || "").trim();
   const groqKey = (env.GROQ_API_KEY || "").trim();
 
+  const keys: Record<"gemini" | "groq" | "deepseek", string> = {
+    gemini: geminiKey && geminiKey !== "your_gemini_api_key_here" ? geminiKey : "",
+    groq: groqKey && groqKey !== "your_groq_api_key_here" ? groqKey : "",
+    deepseek: deepseekKey && deepseekKey !== "your_deepseek_api_key_here" ? deepseekKey : "",
+  };
+
   const errors: string[] = [];
 
-  if (deepseekKey && deepseekKey !== "your_deepseek_api_key_here") {
+  for (const provider of getProviderOrder(env)) {
+    const apiKey = keys[provider];
+    if (!apiKey) continue;
     try {
-      const res = await callOpenAiEdge({
-        endpoint: "https://api.deepseek.com/chat/completions",
-        model: "deepseek-chat",
-        apiKey: deepseekKey,
-        ...options,
-      });
-      return { ...res, _engine: "deepseek" };
+      let res: any;
+      if (provider === "gemini") {
+        res = await callGeminiEdge({ apiKey, ...options });
+      } else if (provider === "groq") {
+        res = await callOpenAiEdge({
+          endpoint: "https://api.groq.com/openai/v1/chat/completions",
+          model: "llama-3.3-70b-versatile",
+          apiKey,
+          ...options,
+        });
+      } else {
+        res = await callOpenAiEdge({
+          endpoint: "https://api.deepseek.com/chat/completions",
+          model: "deepseek-chat",
+          apiKey,
+          ...options,
+        });
+      }
+      await writeEdgeAiCache(cacheHash, res);
+      return { ...res, _engine: provider };
     } catch (e: any) {
-      errors.push(`DeepSeek: ${e?.message || String(e)}`);
-    }
-  }
-
-  if (geminiKey && geminiKey !== "your_gemini_api_key_here") {
-    try {
-      const res = await callGeminiEdge({ apiKey: geminiKey, ...options });
-      return { ...res, _engine: "gemini" };
-    } catch (e: any) {
-      errors.push(`Gemini: ${e?.message || String(e)}`);
-    }
-  }
-
-  if (groqKey && groqKey !== "your_groq_api_key_here") {
-    try {
-      const res = await callOpenAiEdge({
-        endpoint: "https://api.groq.com/openai/v1/chat/completions",
-        model: "llama-3.3-70b-versatile",
-        apiKey: groqKey,
-        ...options,
-      });
-      return { ...res, _engine: "groq" };
-    } catch (e: any) {
-      errors.push(`Groq: ${e?.message || String(e)}`);
+      errors.push(`${provider}: ${e?.message || String(e)}`);
     }
   }
 
   if (errors.length === 0) {
     const err: any = new Error(
-      "AI API key is not configured in Cloudflare Workers. Add DEEPSEEK_API_KEY (or GEMINI_API_KEY / GROQ_API_KEY) via Cloudflare Workers dashboard -> Settings -> Variables and Secrets or wrangler secret put, then redeploy."
+      "AI API key is not configured in Cloudflare Workers. Add GEMINI_API_KEY, GROQ_API_KEY, or DEEPSEEK_API_KEY in Cloudflare Workers Variables and Secrets."
     );
     err.missingApiKey = true;
     throw err;
@@ -494,14 +631,20 @@ export async function onRequest(context: CFContext): Promise<Response> {
   try {
     // Health check
     if (apiPath === "health" && request.method === "GET") {
+      const disabled = (env.DISABLE_CLOUD_AI || "").trim().toLowerCase() === "true";
       const hasDeepseek = Boolean(env.DEEPSEEK_API_KEY && env.DEEPSEEK_API_KEY !== "your_deepseek_api_key_here");
       const hasGemini = Boolean(env.GEMINI_API_KEY && env.GEMINI_API_KEY !== "your_gemini_api_key_here");
       const hasGroq = Boolean(env.GROQ_API_KEY && env.GROQ_API_KEY !== "your_groq_api_key_here");
-      const aiConfigured = hasDeepseek || hasGemini || hasGroq;
-      const primaryProvider = hasDeepseek ? "deepseek" : hasGemini ? "gemini" : hasGroq ? "groq" : "none";
+      const aiConfigured = !disabled && (hasDeepseek || hasGemini || hasGroq);
+      const order = getProviderOrder(env);
+      const primaryProvider = disabled
+        ? "disabled"
+        : order.find((p) =>
+            p === "gemini" ? hasGemini : p === "groq" ? hasGroq : hasDeepseek
+          ) || "none";
       return jsonResponse({
         status: "ok",
-        runtime: "cloudflare-pages",
+        runtime: "cloudflare-workers",
         aiConfigured,
         primaryProvider,
         timestamp: Date.now(),
@@ -722,28 +865,39 @@ export async function onRequest(context: CFContext): Promise<Response> {
       return jsonResponse({ success: true, snippet });
     }
 
+    // Rate-limit guard on all Cloud AI endpoints
+    if (apiPath.startsWith("ai/") && request.method === "POST") {
+      const limitCheck = checkEdgeRateLimit(request);
+      if (!limitCheck.allowed) {
+        return jsonResponse(
+          {
+            success: false,
+            rateLimited: true,
+            error: "Cloud AI rate limit reached — switching to on-device Python guide.",
+          },
+          429
+        );
+      }
+    }
+
     // AI: Debug
     if (apiPath === "ai/debug" && request.method === "POST") {
       if (!body.code) return jsonResponse({ error: "Code is required" }, 400);
-      const prompt = `You are an expert Python tutor for beginner and intermediate learners. Never use emojis.
-Analyze this Python code and the execution error (if any):
-
-PYTHON CODE:
+      const clampedCode = clampText(body.code, 3000);
+      const clampedErr = clampText(body.errorMessage || "", 600);
+      const prompt = `Concise Python tutor. No emojis. Fix the bug briefly:
 \`\`\`python
-${body.code}
+${clampedCode}
 \`\`\`
-
-ERROR / ISSUE REPORTED:
-${body.errorMessage || "No explicit error, but code might have logical or runtime bugs."}
-
-Respond ONLY in valid JSON matching this structure:
+Error: ${clampedErr || "Find logical or runtime bug."}
+Respond in JSON:
 {
-  "fixedCode": "string (the full corrected python code)",
-  "explanation": "string (clear summary of the bug and how it was fixed)",
-  "bugType": "string (e.g. IndentationError, TypeError, SyntaxError, LogicError)",
-  "tips": ["string", "string"]
+  "fixedCode": "string",
+  "explanation": "string (1-2 sentences)",
+  "bugType": "string",
+  "tips": ["string"]
 }`;
-      const parsed = await callCloudflareAi(env, { prompt, responseType: "json", maxTokens: 4096 });
+      const parsed = await callCloudflareAi(env, { cachePrefix: "debug_v3", prompt, responseType: "json", maxTokens: 950 });
       if (typeof parsed.explanation === "string") parsed.explanation = stripDecorativeEmojis(parsed.explanation);
       if (Array.isArray(parsed.tips)) {
         parsed.tips = parsed.tips.map((t: any) => (typeof t === "string" ? stripDecorativeEmojis(t) : t));
@@ -754,19 +908,17 @@ Respond ONLY in valid JSON matching this structure:
     // AI: Add comments
     if (apiPath === "ai/add-comments" && request.method === "POST") {
       if (!body.code) return jsonResponse({ error: "Code is required" }, 400);
-      const prompt = `You are a Python programming guide. Add concise, educational inline Python comments (# comments) to this entire code so a student can understand every part. Preserve all functionality and never use emojis:
-
-PYTHON CODE:
+      const clampedCode = clampText(body.code, 3000);
+      const prompt = `Add concise # comments explaining key lines. Keep logic intact. No emojis:
 \`\`\`python
-${body.code}
+${clampedCode}
 \`\`\`
-
-Respond ONLY in valid JSON with format:
+Respond in JSON:
 {
-  "commentedCode": "string (the full python code with added educational comments)",
-  "summary": "string (brief sentence describing what this code achieves)"
+  "commentedCode": "string",
+  "summary": "string (1 sentence)"
 }`;
-      const parsed = await callCloudflareAi(env, { prompt, responseType: "json", maxTokens: 4096 });
+      const parsed = await callCloudflareAi(env, { cachePrefix: "comment_v3", prompt, responseType: "json", maxTokens: 1000 });
       if (typeof parsed.summary === "string") parsed.summary = stripDecorativeEmojis(parsed.summary);
       return jsonResponse({ success: true, ...parsed });
     }
@@ -774,19 +926,18 @@ Respond ONLY in valid JSON with format:
     // AI: Explain
     if (apiPath === "ai/explain" && request.method === "POST") {
       if (!body.code) return jsonResponse({ error: "Code is required" }, 400);
-      const prompt = `Explain the following Python code step-by-step for a learner (do not use emojis):
-
+      const clampedCode = clampText(body.code, 3000);
+      const prompt = `Explain this Python snippet simply (no emojis):
 \`\`\`python
-${body.code}
+${clampedCode}
 \`\`\`
-
-Respond in JSON format:
+Respond in JSON:
 {
-  "summary": "string",
-  "steps": ["string", "string"],
-  "concepts": ["string", "string"]
+  "summary": "string (1-2 sentences)",
+  "steps": ["string"],
+  "concepts": ["string"]
 }`;
-      const parsed = await callCloudflareAi(env, { prompt, responseType: "json", maxTokens: 3000 });
+      const parsed = await callCloudflareAi(env, { cachePrefix: "explain_v3", prompt, responseType: "json", maxTokens: 750 });
       if (typeof parsed.summary === "string") parsed.summary = stripDecorativeEmojis(parsed.summary);
       if (Array.isArray(parsed.steps)) {
         parsed.steps = parsed.steps.map((s: any) => (typeof s === "string" ? stripDecorativeEmojis(s) : s));
@@ -796,46 +947,48 @@ Respond in JSON format:
 
     // AI: Hint
     if (apiPath === "ai/hint" && request.method === "POST") {
-      const prompt = `A student is working on "${body.lessonTitle || "Python Exercise"}".
-Lesson task: ${body.lessonDescription || "Practice Python"}
-Expected output: ${body.targetOutput || "Correct solution"}
-Student's current code:
+      const clampedCode = clampText(body.currentCode || "# Empty", 2000);
+      const prompt = `Lesson "${clampText(body.lessonTitle || "Python Exercise", 100)}": ${clampText(
+        body.lessonDescription || "Practice Python",
+        250
+      )}.
+Goal: ${clampText(body.targetOutput || "Correct solution", 150)}
+Code:
 \`\`\`python
-${body.currentCode || "# Empty"}
+${clampedCode}
 \`\`\`
-Give a clear, encouraging hint (2-3 sentences max, no emojis). Respond in JSON:
+Give a 1-2 sentence hint without giving the full solution (no emojis). JSON:
 {
-  "hint": "string (helpful tip)",
+  "hint": "string",
   "conceptToReview": "string"
 }`;
-      const parsed = await callCloudflareAi(env, { prompt, responseType: "json", maxTokens: 1000 });
+      const parsed = await callCloudflareAi(env, { cachePrefix: "hint_v3", prompt, responseType: "json", maxTokens: 280 });
       if (typeof parsed.hint === "string") parsed.hint = stripDecorativeEmojis(parsed.hint);
       return jsonResponse({ success: true, ...parsed });
     }
 
     // AI: Chat (General-purpose + Python & Curriculum Specialist)
     if (apiPath === "ai/chat" && request.method === "POST") {
-      const effectiveCode = body.code || body.currentCode || "";
+      const normalizedMessages = clampMessages(body.messages);
+      const lastUserMessage = [...normalizedMessages].reverse().find((m) => m.role === "user")?.text || "";
+
+      const effectiveCode = clampText(body.code || body.currentCode || "", 2200);
       const systemInstruction = buildMilkyChatSystemInstruction({
         code: effectiveCode,
         lessonContext: body.lessonContext,
         customSystem: body.systemInstruction,
+        latestUserMessage: lastUserMessage,
       });
 
-      const normalizedMessages = (body.messages || []).map((m: any) => ({
-        role: m.role === "assistant" || m.role === "model" ? "model" : "user",
-        text: m.text || "",
-      }));
-
       const result = await callCloudflareAi(env, {
+        cachePrefix: "chat_v3",
         systemInstruction,
         prompt: "",
         messages: normalizedMessages,
         responseType: "text",
-        maxTokens: 4096,
+        maxTokens: 1100,
       });
 
-      const lastUserMessage = [...normalizedMessages].reverse().find((m: any) => m.role === "user")?.text || "";
       const allowEmojis = /emoji|unicode/i.test(lastUserMessage);
       const cleanedText = allowEmojis ? result.text : stripDecorativeEmojis(result.text);
 
@@ -844,8 +997,7 @@ Give a clear, encouraging hint (2-3 sentences max, no emojis). Respond in JSON:
 
     // AI: Quiz
     if (apiPath === "ai/quiz" && request.method === "POST") {
-      const systemInstruction = `You are a Python curriculum specialist creating randomized, engaging quiz questions. Never use emojis.
-Format your output strictly as a JSON object with this exact shape:
+      const systemInstruction = `Create one concise Python multiple-choice question. No emojis. JSON only:
 {
   "question": "string",
   "codeSnippet": "string",
@@ -854,16 +1006,16 @@ Format your output strictly as a JSON object with this exact shape:
   "explanation": "string",
   "hint": "string"
 }`;
-      const prompt = `Create a dynamic Python quiz question for:
-Topic: ${body.lessonTitle || "Python Fundamentals"}
-Concept details: ${(body.lessonConcept || "").slice(0, 500)}
+      const prompt = `Topic: ${clampText(body.lessonTitle || "Python Fundamentals", 100)}
+Details: ${clampText(body.lessonConcept || "", 280)}
 Difficulty: ${body.difficulty || "intermediate"}`;
 
       const parsed = await callCloudflareAi(env, {
+        cachePrefix: "quiz_v3",
         systemInstruction,
         prompt,
         responseType: "json",
-        maxTokens: 1500,
+        maxTokens: 480,
       });
 
       if (parsed && parsed.question && Array.isArray(parsed.options) && typeof parsed.correctIndex === "number") {

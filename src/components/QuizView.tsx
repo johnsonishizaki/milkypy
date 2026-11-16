@@ -46,7 +46,6 @@ import {
   clearAllQuizTracking,
   computeOverallQuizStats,
 } from "../lib/quizStorage";
-import { getApiUrl, fetchWithTimeout } from "../lib/apiConfig";
 import { CopyCodeButton } from "./CopyCodeButton";
 import { QuizFeedbackActionsBar } from "./QuizFeedbackActionsBar";
 
@@ -661,78 +660,24 @@ export const QuizView: React.FC<QuizViewProps> = ({
     handleNextQuestion,
   ]);
 
-  // Generate a Bonus Question appended directly into the current deck
-  const handleAddAiChallengeQuestion = async () => {
+  // Generate an instant local Bonus Question appended directly into the current deck ($0 API cost)
+  const handleAddAiChallengeQuestion = () => {
     setIsGeneratingAiQ(true);
     setAiStatusNote(null);
 
-    const targetLessonItem =
-      allLessons.find((l) => l.lesson.id === selectedLessonId) ||
-      allLessons.find((l) => l.lesson.id === progress.lastActiveLessonId) ||
-      allLessons[0];
-
-    const topicTitle = targetLessonItem?.lesson.title || "Python Fundamentals";
-    const topicConcept =
-      targetLessonItem?.lesson.summary ||
-      targetLessonItem?.lesson.learningObjectives?.join("; ") ||
-      "Variables, conditionals, loops, lists, dictionaries, and functions";
-
     try {
-      const res = await fetchWithTimeout(getApiUrl("/api/ai/quiz"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        timeoutMs: 15000,
-        body: JSON.stringify({
-          lessonId: targetLessonItem?.lesson.id || "custom",
-          lessonTitle: topicTitle,
-          lessonConcept: topicConcept,
-          difficulty:
-            difficultyPref === "beginner" ? "beginner" : "intermediate",
-        }),
-      });
+      const targetLessonItem =
+        allLessons.find((l) => l.lesson.id === selectedLessonId) ||
+        allLessons.find((l) => l.lesson.id === progress.lastActiveLessonId) ||
+        allLessons[0];
 
-      const ct = res.headers.get("content-type") || "";
-      if (!ct.includes("application/json")) {
-        throw new Error("AI endpoint unavailable in current environment.");
-      }
-      const data = await res.json();
-      if (!res.ok || !data?.success || !data?.quiz) {
-        throw new Error(data?.error || "Could not create question.");
-      }
+      const topicTitle = targetLessonItem?.lesson.title || "Python Fundamentals";
+      const topicConcept =
+        targetLessonItem?.lesson.summary ||
+        targetLessonItem?.lesson.learningObjectives?.join("; ") ||
+        "Variables, conditionals, loops, lists, dictionaries, and functions";
 
-      const aiQ: DynamicQuizQuestion = {
-        ...data.quiz,
-        moduleId: targetLessonItem?.module.id,
-        moduleTitle: targetLessonItem?.module.title,
-        conceptTag: "Bonus",
-        source: "ai",
-      };
-
-      if (stage === "active") {
-        const insertAt = currentIdx + 1;
-        setDeck((prev) => [
-          ...prev.slice(0, insertAt),
-          aiQ,
-          ...prev.slice(insertAt),
-        ]);
-        setAiStatusNote(`Added a bonus question on "${topicTitle}" next.`);
-      } else {
-        setDeck([aiQ]);
-        setScopeLabel(`Bonus: ${topicTitle}`);
-        setSelectionReason(`Bonus question on ${topicTitle}.`);
-        setCurrentIdx(0);
-        setReviewingIdx(null);
-        setSelectedOption(null);
-        setShowHint(false);
-        setAttempts([]);
-        setStreak(0);
-        setBestStreak(0);
-        setSessionXp(0);
-        setElapsedSeconds(0);
-        setStage("active");
-      }
-    } catch {
-      const fallbackQ = generateRandomQuiz(
+      const localQ = generateRandomQuiz(
         targetLessonItem?.lesson.id || "custom",
         topicTitle,
         topicConcept,
@@ -741,16 +686,17 @@ export const QuizView: React.FC<QuizViewProps> = ({
           ? { id: targetLessonItem.module.id, title: targetLessonItem.module.title }
           : undefined
       );
+
       if (stage === "active") {
         const insertAt = currentIdx + 1;
         setDeck((prev) => [
           ...prev.slice(0, insertAt),
-          fallbackQ,
+          localQ,
           ...prev.slice(insertAt),
         ]);
         setAiStatusNote(`Added a new question on "${topicTitle}" next.`);
       } else {
-        setDeck([fallbackQ]);
+        setDeck([localQ]);
         setScopeLabel(`Quick Quiz: ${topicTitle}`);
         setSelectionReason(`Practice question for ${topicTitle}.`);
         setCurrentIdx(0);

@@ -7,6 +7,8 @@ interface WorkerEnv {
   DEEPSEEK_API_KEY?: string;
   GEMINI_API_KEY?: string;
   GROQ_API_KEY?: string;
+  AI_PRIMARY_PROVIDER?: string;
+  DISABLE_CLOUD_AI?: string;
   [key: string]: unknown;
 }
 

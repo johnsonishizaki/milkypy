@@ -170,21 +170,35 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
+function clampText(val: unknown, maxChars: number): string {
+  const s = typeof val === "string" ? val.trim() : String(val ?? "").trim();
+  if (!s || s.length <= maxChars) return s;
+  return `${s.slice(0, maxChars)}\n... (truncated)`;
+}
+
+function clampMessages(
+  messages?: Array<{ role: string; text: string }>
+): Array<{ role: "user" | "model"; text: string }> {
+  const recent = (messages || []).slice(-6);
+  return recent
+    .map((m, idx) => {
+      const isLast = idx === recent.length - 1;
+      const text = clampText(m?.text || "", isLast ? 1200 : 750);
+      return {
+        role: (m?.role === "assistant" || m?.role === "model" ? "model" : "user") as "user" | "model",
+        text,
+      };
+    })
+    .filter((m) => m.text.length > 0);
+}
+
 function normalizeGeminiContents(
   messages?: Array<{ role: string; text: string }>,
   prompt?: string
 ): Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> {
-  const raw: Array<{ role: "user" | "model"; text: string }> = [];
-  const recentMessages = (messages || []).slice(-14);
-  for (const m of recentMessages) {
-    const text = (m?.text || "").trim();
-    if (!text) continue;
-    const role: "user" | "model" =
-      m.role === "assistant" || m.role === "model" ? "model" : "user";
-    raw.push({ role, text });
-  }
+  const raw = clampMessages(messages);
   if (prompt && prompt.trim()) {
-    raw.push({ role: "user", text: prompt.trim() });
+    raw.push({ role: "user", text: clampText(prompt, 3800) });
   }
 
   // Gemini requires contents to start with a user turn and alternate cleanly
@@ -226,6 +240,45 @@ function getCacheKey(type: string, prompt: string, extra?: string): string {
   return `${type}_${Math.abs(hash)}`;
 }
 
+// Per-IP Sliding-Window Rate Limiter for Cloud AI endpoints
+const serverAiRateLimits = new Map<string, { shortWindow: number[]; hourWindow: number[] }>();
+
+function checkServerAiRateLimit(req: express.Request): { allowed: boolean } {
+  const forwarded = req.headers["x-forwarded-for"];
+  const ip =
+    (typeof forwarded === "string" ? forwarded.split(",")[0].trim() : undefined) ||
+    req.ip ||
+    "anonymous";
+  const now = Date.now();
+  const tenMinAgo = now - 10 * 60 * 1000;
+  const oneHourAgo = now - 60 * 60 * 1000;
+
+  const entry = serverAiRateLimits.get(ip) || { shortWindow: [], hourWindow: [] };
+  entry.shortWindow = entry.shortWindow.filter((t) => t > tenMinAgo);
+  entry.hourWindow = entry.hourWindow.filter((t) => t > oneHourAgo);
+
+  if (entry.shortWindow.length >= 15 || entry.hourWindow.length >= 40) {
+    serverAiRateLimits.set(ip, entry);
+    return { allowed: false };
+  }
+
+  entry.shortWindow.push(now);
+  entry.hourWindow.push(now);
+  if (serverAiRateLimits.size > 500) {
+    const firstIp = serverAiRateLimits.keys().next().value;
+    if (firstIp) serverAiRateLimits.delete(firstIp);
+  }
+  serverAiRateLimits.set(ip, entry);
+  return { allowed: true };
+}
+
+function getServerProviderOrder(): Array<"gemini" | "groq" | "deepseek"> {
+  const preferred = (process.env.AI_PRIMARY_PROVIDER || "").trim().toLowerCase();
+  if (preferred === "deepseek") return ["deepseek", "gemini", "groq"];
+  if (preferred === "groq") return ["groq", "gemini", "deepseek"];
+  return ["gemini", "groq", "deepseek"];
+}
+
 // Gemini SDK Caller (@google/genai)
 async function callGeminiDirect(options: {
   systemInstruction?: string;
@@ -261,8 +314,9 @@ async function callGeminiDirect(options: {
           contents,
           config: {
             abortSignal: controller.signal,
-            ...(options.systemInstruction ? { systemInstruction: options.systemInstruction } : {}),
+            ...(options.systemInstruction ? { systemInstruction: clampText(options.systemInstruction, 4500) } : {}),
             thinkingConfig: { thinkingLevel: candidate.thinkingLevel },
+            maxOutputTokens: Math.min(options.maxTokens || 900, 1400),
             ...(options.responseType === "json" ? { responseMimeType: "application/json" } : {}),
           },
         }),
@@ -289,7 +343,7 @@ async function callGeminiDirect(options: {
   throw lastErr || new Error("Gemini API request failed.");
 }
 
-// OpenAI-Compatible Caller (DeepSeek primary / Groq fallback)
+// OpenAI-Compatible Caller (Groq / DeepSeek)
 async function callOpenAiCompatible(options: {
   endpoint: string;
   model: string;
@@ -301,7 +355,7 @@ async function callOpenAiCompatible(options: {
   maxTokens?: number;
 }): Promise<any> {
   const formattedMessages: Array<{ role: string; content: string }> = [];
-  let systemContent = options.systemInstruction || "";
+  let systemContent = clampText(options.systemInstruction || "", 4500);
   if (
     options.responseType === "json" &&
     !systemContent.toLowerCase().includes("json") &&
@@ -312,18 +366,15 @@ async function callOpenAiCompatible(options: {
   if (systemContent) {
     formattedMessages.push({ role: "system", content: systemContent });
   }
-  if (options.messages && options.messages.length > 0) {
-    for (const m of options.messages.slice(-14)) {
-      const text = (m.text || "").trim();
-      if (!text) continue;
-      formattedMessages.push({
-        role: m.role === "model" || m.role === "assistant" ? "assistant" : "user",
-        content: text,
-      });
-    }
+  const clampedHistory = clampMessages(options.messages);
+  for (const m of clampedHistory) {
+    formattedMessages.push({
+      role: m.role === "model" ? "assistant" : "user",
+      content: m.text,
+    });
   }
   if (options.prompt && options.prompt.trim()) {
-    formattedMessages.push({ role: "user", content: options.prompt.trim() });
+    formattedMessages.push({ role: "user", content: clampText(options.prompt, 3800) });
   }
   if (formattedMessages.length === 0) {
     formattedMessages.push({ role: "user", content: "Hello" });
@@ -332,8 +383,8 @@ async function callOpenAiCompatible(options: {
   const payload: any = {
     model: options.model,
     messages: formattedMessages,
-    temperature: 0.35,
-    max_tokens: Math.min(options.maxTokens || 4096, 8192),
+    temperature: 0.3,
+    max_tokens: Math.min(options.maxTokens || 900, 1400),
   };
 
   if (options.responseType === "json") {
@@ -373,7 +424,7 @@ async function callOpenAiCompatible(options: {
   return { text: content };
 }
 
-// Unified AI Engine (DeepSeek primary when DEEPSEEK_API_KEY is set, with Gemini & Groq fallback)
+// Unified AI Engine (Free-tier Gemini & Groq prioritized first by default, DeepSeek fallback)
 async function callPlatformAi(options: {
   cacheKeyPrefix: string;
   systemInstruction?: string;
@@ -382,10 +433,17 @@ async function callPlatformAi(options: {
   responseType?: "json" | "text";
   maxTokens?: number;
 }): Promise<any> {
+  if ((process.env.DISABLE_CLOUD_AI || "").trim().toLowerCase() === "true") {
+    const missingErr: any = new Error("Cloud AI is paused via DISABLE_CLOUD_AI — using built-in offline guide.");
+    missingErr.missingApiKey = true;
+    throw missingErr;
+  }
+
+  const clampedHistory = clampMessages(options.messages);
   const fullText =
-    options.prompt +
-    (options.systemInstruction || "") +
-    (options.messages ? options.messages.map((m) => `${m.role}:${m.text}`).join("|") : "");
+    clampText(options.prompt, 3800) +
+    clampText(options.systemInstruction || "", 4500) +
+    clampedHistory.map((m) => `${m.role}:${m.text}`).join("|");
   const cacheKey = getCacheKey(options.cacheKeyPrefix, fullText);
   const cached = aiResponseCache.get(cacheKey);
 
@@ -397,57 +455,47 @@ async function callPlatformAi(options: {
   const geminiKey = (process.env.GEMINI_API_KEY || "").trim();
   const groqKey = (process.env.GROQ_API_KEY || "").trim();
 
+  const keys: Record<"gemini" | "groq" | "deepseek", string> = {
+    gemini: geminiKey && geminiKey !== "your_gemini_api_key_here" ? geminiKey : "",
+    groq: groqKey && groqKey !== "your_groq_api_key_here" ? groqKey : "",
+    deepseek: deepseekKey && deepseekKey !== "your_deepseek_api_key_here" ? deepseekKey : "",
+  };
+
   const errors: string[] = [];
 
-  if (deepseekKey && deepseekKey !== "your_deepseek_api_key_here") {
+  for (const provider of getServerProviderOrder()) {
+    const apiKey = keys[provider];
+    if (!apiKey) continue;
     try {
-      const result = await callOpenAiCompatible({
-        endpoint: "https://api.deepseek.com/chat/completions",
-        model: "deepseek-chat",
-        apiKey: deepseekKey,
-        ...options,
-      });
+      let result: any;
+      if (provider === "gemini") {
+        result = await callGeminiDirect({ ...options, apiKey });
+      } else if (provider === "groq") {
+        result = await callOpenAiCompatible({
+          endpoint: "https://api.groq.com/openai/v1/chat/completions",
+          model: "llama-3.3-70b-versatile",
+          apiKey,
+          ...options,
+        });
+      } else {
+        result = await callOpenAiCompatible({
+          endpoint: "https://api.deepseek.com/chat/completions",
+          model: "deepseek-chat",
+          apiKey,
+          ...options,
+        });
+      }
       aiResponseCache.set(cacheKey, { data: result, timestamp: Date.now() });
-      return { ...result, _engine: "deepseek" };
+      return { ...result, _engine: provider };
     } catch (err: any) {
-      console.warn("[DeepSeek AI Error]:", err?.message || err);
-      errors.push(`DeepSeek: ${err?.message || err}`);
-    }
-  }
-
-  if (geminiKey && geminiKey !== "your_gemini_api_key_here") {
-    try {
-      const result = await callGeminiDirect({
-        ...options,
-        apiKey: geminiKey,
-      });
-      aiResponseCache.set(cacheKey, { data: result, timestamp: Date.now() });
-      return { ...result, _engine: "gemini" };
-    } catch (err: any) {
-      console.warn("[Gemini AI Error]:", err?.message || err);
-      errors.push(`Gemini: ${err?.message || err}`);
-    }
-  }
-
-  if (groqKey && groqKey !== "your_groq_api_key_here") {
-    try {
-      const result = await callOpenAiCompatible({
-        endpoint: "https://api.groq.com/openai/v1/chat/completions",
-        model: "llama-3.3-70b-versatile",
-        apiKey: groqKey,
-        ...options,
-      });
-      aiResponseCache.set(cacheKey, { data: result, timestamp: Date.now() });
-      return { ...result, _engine: "groq" };
-    } catch (err: any) {
-      console.warn("[Groq AI Error]:", err?.message || err);
-      errors.push(`Groq: ${err?.message || err}`);
+      console.warn(`[${provider} AI Error]:`, err?.message || err);
+      errors.push(`${provider}: ${err?.message || err}`);
     }
   }
 
   if (errors.length === 0) {
     const missingErr: any = new Error(
-      "No AI API key configured on the server. Set DEEPSEEK_API_KEY (or GEMINI_API_KEY / GROQ_API_KEY) in environment variables."
+      "No AI API key configured on the server. Set GEMINI_API_KEY, GROQ_API_KEY, or DEEPSEEK_API_KEY in environment variables."
     );
     missingErr.missingApiKey = true;
     throw missingErr;
@@ -567,11 +615,15 @@ app.post("/api/py/run", (req, res) => {
 
 // API Routes
 app.get("/api/health", (_req, res) => {
+  const disabled = (process.env.DISABLE_CLOUD_AI || "").trim().toLowerCase() === "true";
   const hasDeepseek = Boolean(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY !== "your_deepseek_api_key_here");
   const hasGemini = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "your_gemini_api_key_here");
   const hasGroq = Boolean(process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "your_groq_api_key_here");
-  const aiConfigured = hasDeepseek || hasGemini || hasGroq;
-  const primaryProvider = hasDeepseek ? "deepseek" : hasGemini ? "gemini" : hasGroq ? "groq" : "none";
+  const aiConfigured = !disabled && (hasDeepseek || hasGemini || hasGroq);
+  const order = getServerProviderOrder();
+  const primaryProvider = disabled
+    ? "disabled"
+    : order.find((p) => (p === "gemini" ? hasGemini : p === "groq" ? hasGroq : hasDeepseek)) || "none";
   res.json({ status: "ok", runtime: "node-express", aiConfigured, primaryProvider, timestamp: Date.now() });
 });
 
@@ -934,6 +986,22 @@ app.get("/api/snippets/:id", async (req, res) => {
   }
 });
 
+// Middleware: Rate limit all Cloud AI endpoints
+app.use("/api/ai", (req, res, next) => {
+  if (req.method === "POST") {
+    const check = checkServerAiRateLimit(req);
+    if (!check.allowed) {
+      res.status(429).json({
+        success: false,
+        rateLimited: true,
+        error: "Cloud AI rate limit reached — switching to on-device Python guide.",
+      });
+      return;
+    }
+  }
+  next();
+});
+
 // AI Endpoint: Debug & Fix Code
 app.post("/api/ai/debug", async (req, res) => {
   try {
@@ -943,36 +1011,26 @@ app.post("/api/ai/debug", async (req, res) => {
       return;
     }
 
-    const prompt = `You are an expert Python tutor for beginner and intermediate learners.
-Analyze this Python code and the execution error (if any):
-
-PYTHON CODE:
+    const clampedCode = clampText(code, 3000);
+    const clampedErr = clampText(errorMessage || "", 600);
+    const prompt = `Concise Python tutor. No emojis. Fix the bug briefly:
 \`\`\`python
-${code}
+${clampedCode}
 \`\`\`
-
-ERROR / ISSUE REPORTED:
-${errorMessage || "No explicit error, but code might have logical or runtime bugs."}
-
-Instructions:
-1. Provide a complete, fixed, working version of the Python code.
-2. Explain what caused the issue in simple, clear terms.
-3. List 2-3 key takeaways or tips for the student.
-4. Never use emojis.
-
-Respond ONLY in valid JSON matching this structure:
+Error: ${clampedErr || "Find logical or runtime bug."}
+Respond in JSON:
 {
-  "fixedCode": "string (the full corrected python code)",
-  "explanation": "string (clear summary of the bug and how it was fixed)",
-  "bugType": "string (e.g. IndentationError, TypeError, SyntaxError, LogicError)",
-  "tips": ["string", "string"]
+  "fixedCode": "string",
+  "explanation": "string (1-2 sentences)",
+  "bugType": "string",
+  "tips": ["string"]
 }`;
 
     const parsed = await callPlatformAi({
-      cacheKeyPrefix: "debug_v2",
+      cacheKeyPrefix: "debug_v3",
       prompt,
       responseType: "json",
-      maxTokens: 4096,
+      maxTokens: 950,
     });
 
     if (typeof parsed.explanation === "string") {
@@ -1002,29 +1060,22 @@ app.post("/api/ai/add-comments", async (req, res) => {
       return;
     }
 
-    const prompt = `You are a Python programming guide. Add concise, educational, step-by-step inline Python comments (# comments) to the following code so a learner can understand how every part works.
-
-PYTHON CODE:
+    const clampedCode = clampText(code, 3000);
+    const prompt = `Add concise # comments explaining key lines. Keep logic intact. No emojis:
 \`\`\`python
-${code}
+${clampedCode}
 \`\`\`
-
-Instructions:
-- Preserve all existing functionality and return the complete script.
-- Insert clear, informative comments above or beside key code lines.
-- Never use emojis.
-
-Respond ONLY in valid JSON with format:
+Respond in JSON:
 {
-  "commentedCode": "string (the full python code with added educational comments)",
-  "summary": "string (brief sentence describing what this code achieves)"
+  "commentedCode": "string",
+  "summary": "string (1 sentence)"
 }`;
 
     const parsed = await callPlatformAi({
-      cacheKeyPrefix: "comment_v2",
+      cacheKeyPrefix: "comment_v3",
       prompt,
       responseType: "json",
-      maxTokens: 4096,
+      maxTokens: 1000,
     });
 
     if (typeof parsed.summary === "string") {
@@ -1051,29 +1102,23 @@ app.post("/api/ai/explain", async (req, res) => {
       return;
     }
 
-    const prompt = `Explain the following Python code step-by-step for a learner (do not use emojis):
-
+    const clampedCode = clampText(code, 3000);
+    const prompt = `Explain this Python snippet simply (no emojis):
 \`\`\`python
-${code}
+${clampedCode}
 \`\`\`
-
-Provide:
-1. High-level summary of what the code does.
-2. Step-by-step execution walkthrough.
-3. Important Python concepts used (e.g. loops, list comprehensions, f-strings).
-
-Respond in JSON format:
+Respond in JSON:
 {
-  "summary": "string",
-  "steps": ["string", "string"],
-  "concepts": ["string", "string"]
+  "summary": "string (1-2 sentences)",
+  "steps": ["string"],
+  "concepts": ["string"]
 }`;
 
     const parsed = await callPlatformAi({
-      cacheKeyPrefix: "explain_v2",
+      cacheKeyPrefix: "explain_v3",
       prompt,
       responseType: "json",
-      maxTokens: 3000,
+      maxTokens: 750,
     });
 
     if (typeof parsed.summary === "string") {
@@ -1098,29 +1143,27 @@ Respond in JSON format:
 app.post("/api/ai/hint", async (req, res) => {
   try {
     const { lessonTitle, lessonDescription, currentCode, targetOutput } = req.body;
-
-    const prompt = `A student is working on the lesson "${lessonTitle || "Python Exercise"}".
-Lesson task: ${lessonDescription || "Practice Python"}
-Expected output/goal: ${targetOutput || "Correct solution"}
-
-Student's current code:
+    const clampedCode = clampText(currentCode || "# Empty", 2000);
+    const prompt = `Lesson "${clampText(lessonTitle || "Python Exercise", 100)}": ${clampText(
+      lessonDescription || "Practice Python",
+      250
+    )}.
+Goal: ${clampText(targetOutput || "Correct solution", 150)}
+Code:
 \`\`\`python
-${currentCode || "# Empty"}
+${clampedCode}
 \`\`\`
-
-Give a clear, encouraging hint (2-3 sentences max, no emojis) to help them take the next logical step without giving away the complete code directly.
-
-Respond in JSON:
+Give a 1-2 sentence hint without giving the full solution (no emojis). JSON:
 {
-  "hint": "string (helpful tip)",
+  "hint": "string",
   "conceptToReview": "string"
 }`;
 
     const parsed = await callPlatformAi({
-      cacheKeyPrefix: "hint_v2",
+      cacheKeyPrefix: "hint_v3",
       prompt,
       responseType: "json",
-      maxTokens: 1000,
+      maxTokens: 280,
     });
 
     if (typeof parsed.hint === "string") {
@@ -1142,28 +1185,26 @@ Respond in JSON:
 app.post("/api/ai/chat", async (req, res) => {
   try {
     const { messages, code, currentCode, lessonContext, systemInstruction: customSystem } = req.body;
-    const effectiveCode = code || currentCode || "";
+    const normalizedMessages = clampMessages(messages);
+    const lastUserMessage = [...normalizedMessages].reverse().find((m) => m.role === "user")?.text || "";
+
+    const effectiveCode = clampText(code || currentCode || "", 2200);
     const systemInstruction = buildMilkyChatSystemInstruction({
       code: effectiveCode,
       lessonContext,
       customSystem,
+      latestUserMessage: lastUserMessage,
     });
 
-    const normalizedMessages = (messages || []).map((m: any) => ({
-      role: (m.role === "assistant" || m.role === "model" ? "model" : "user") as "user" | "model",
-      text: m.text || "",
-    }));
-
     const result = await callPlatformAi({
-      cacheKeyPrefix: "chat_v2",
+      cacheKeyPrefix: "chat_v3",
       systemInstruction,
       prompt: "",
       messages: normalizedMessages,
       responseType: "text",
-      maxTokens: 4096,
+      maxTokens: 1100,
     });
 
-    const lastUserMessage = [...normalizedMessages].reverse().find((m) => m.role === "user")?.text || "";
     const allowEmojis = /emoji|unicode/i.test(lastUserMessage);
     const cleanedText = allowEmojis ? result.text : stripDecorativeEmojis(result.text);
 
@@ -1183,31 +1224,26 @@ app.post("/api/ai/quiz", async (req, res) => {
   try {
     const { lessonTitle, lessonConcept, difficulty } = req.body;
 
-    const systemInstruction = `You are a Python curriculum specialist creating randomized, engaging quiz questions. Never use emojis.
-Generate a brand-new, unique multiple-choice question testing the specified Python concept.
-Never use generic or repeated presets. Include code snippets where appropriate.
-
-Format your output strictly as a JSON object with this exact shape:
+    const systemInstruction = `Create one concise Python multiple-choice question. No emojis. JSON only:
 {
-  "question": "string (the question prompt)",
-  "codeSnippet": "string (optional python code block, or empty string)",
+  "question": "string",
+  "codeSnippet": "string",
   "options": ["string", "string", "string", "string"],
   "correctIndex": 0,
-  "explanation": "string (clear explanation of why this answer is correct and why other choices are wrong)",
-  "hint": "string (helpful hint to guide the student)"
+  "explanation": "string",
+  "hint": "string"
 }`;
 
-    const prompt = `Create a dynamic Python quiz question for:
-Topic: ${lessonTitle || "Python Fundamentals"}
-Concept details: ${lessonConcept ? lessonConcept.slice(0, 500) : "Variables, types, control flow, functions, or data structures"}
+    const prompt = `Topic: ${clampText(lessonTitle || "Python Fundamentals", 100)}
+Details: ${clampText(lessonConcept || "", 280)}
 Difficulty: ${difficulty || "intermediate"}`;
 
     const parsed = await callPlatformAi({
-      cacheKeyPrefix: "quiz_v2",
+      cacheKeyPrefix: "quiz_v3",
       systemInstruction,
       prompt,
       responseType: "json",
-      maxTokens: 1500,
+      maxTokens: 480,
     });
 
     if (parsed && parsed.question && Array.isArray(parsed.options) && typeof parsed.correctIndex === "number") {

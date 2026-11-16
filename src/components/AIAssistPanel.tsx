@@ -71,6 +71,94 @@ interface AIAssistPanelProps {
 
 type TabType = "chat" | "debug" | "comments" | "explain" | "hint";
 
+const CLIENT_AI_DAILY_LIMIT = 25;
+const CLIENT_AI_USAGE_KEY = "milkypy_ai_daily_usage_v1";
+const CLIENT_AI_CACHE_PREFIX = "milkypy_ai_cache_v1:";
+const memPanelCache = new Map<string, unknown>();
+
+function hashPanelKey(input: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function readPanelCache<T>(rawKey: string): T | null {
+  const key = `${CLIENT_AI_CACHE_PREFIX}${hashPanelKey(rawKey)}`;
+  if (memPanelCache.has(key)) {
+    return memPanelCache.get(key) as T;
+  }
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as T;
+    memPanelCache.set(key, parsed);
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writePanelCache<T>(rawKey: string, value: T): void {
+  const key = `${CLIENT_AI_CACHE_PREFIX}${hashPanelKey(rawKey)}`;
+  if (memPanelCache.size > 60) {
+    const first = memPanelCache.keys().next().value;
+    if (first) memPanelCache.delete(first);
+  }
+  memPanelCache.set(key, value);
+  try {
+    sessionStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore storage quota issues
+  }
+}
+
+function getTodayDateStamp(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function canUseDailyCloudAi(): boolean {
+  try {
+    const raw = localStorage.getItem(CLIENT_AI_USAGE_KEY);
+    if (!raw) return true;
+    const parsed = JSON.parse(raw) as { date?: string; count?: number };
+    if (parsed.date !== getTodayDateStamp()) return true;
+    return (parsed.count || 0) < CLIENT_AI_DAILY_LIMIT;
+  } catch {
+    return true;
+  }
+}
+
+function recordCloudAiCall(): void {
+  try {
+    const today = getTodayDateStamp();
+    const raw = localStorage.getItem(CLIENT_AI_USAGE_KEY);
+    let count = 0;
+    if (raw) {
+      const parsed = JSON.parse(raw) as { date?: string; count?: number };
+      if (parsed.date === today) count = parsed.count || 0;
+    }
+    localStorage.setItem(CLIENT_AI_USAGE_KEY, JSON.stringify({ date: today, count: count + 1 }));
+  } catch {
+    // Ignore localStorage restrictions
+  }
+}
+
+function isStandardPythonError(err?: string): boolean {
+  if (!err) return false;
+  return /\b(SyntaxError|IndentationError|NameError|ZeroDivisionError|TypeError|IndexError|KeyError)\b/.test(
+    err
+  );
+}
+
+function clampClientText(text: string, maxChars: number): string {
+  const s = (text || "").trim();
+  if (!s || s.length <= maxChars) return s;
+  return `${s.slice(0, maxChars)}\n... (truncated)`;
+}
+
 export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
   isOpen,
   onClose,
@@ -196,7 +284,12 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     if (isOpen) {
       setErrorText(null);
       setActiveTab(errorMessage ? "debug" : "chat");
-      setDebugResult(null);
+      const cachedDebug = code.trim()
+        ? readPanelCache<AIDebugResult>(
+            `debug|${code.trim()}|${(errorMessage || "").trim()}`
+          )
+        : null;
+      setDebugResult(cachedDebug);
       reloadChatHistory();
     }
   }, [isOpen, errorMessage]);
@@ -272,8 +365,36 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     }
   }, [chatMessages, activeTab]);
 
-  // Trigger Debug Request
-  const handleDebug = async () => {
+  // Trigger Debug Request (cache + local-first for standard Python errors)
+  const handleDebug = async (forceCloud = false) => {
+    if (!code || !code.trim()) {
+      setDebugResult({
+        bugType: "No Code Yet",
+        explanation: "Write or paste some Python code in the editor first before running Debug.",
+        fixedCode: "# Write your Python code here\nprint('Hello, Python!')",
+        tips: ["Try writing a print() statement or opening a lesson exercise."],
+      });
+      return;
+    }
+
+    const cacheKey = `debug|${code.trim()}|${(errorMessage || "").trim()}`;
+    if (!forceCloud) {
+      const cached = readPanelCache<AIDebugResult>(cacheKey);
+      if (cached) {
+        setErrorText(null);
+        setDebugResult(cached);
+        return;
+      }
+      if (isStandardPythonError(errorMessage)) {
+        const localResult = diagnoseOfflineError(code, errorMessage);
+        setErrorText(
+          "Solved instantly with the built-in Python diagnoser ($0 cloud cost). Use 'Ask Cloud AI' below if you still want a custom fix."
+        );
+        setDebugResult(localResult);
+        return;
+      }
+    }
+
     if (activeAbortRef.current) activeAbortRef.current.abort();
     manualCancelRef.current = false;
     const controller = new AbortController();
@@ -281,7 +402,10 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     setLoading(true);
     setErrorText(null);
 
-    if (!navigator.onLine) {
+    if (!navigator.onLine || !canUseDailyCloudAi()) {
+      if (navigator.onLine && !canUseDailyCloudAi()) {
+        setErrorText("Daily Cloud AI limit reached — showing built-in Python diagnoser.");
+      }
       const localResult = diagnoseOfflineError(code, errorMessage);
       setDebugResult(localResult);
       setLoading(false);
@@ -289,10 +413,14 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     }
 
     try {
+      recordCloudAiCall();
       const res = await fetchWithTimeout(getApiUrl("/api/ai/debug"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, errorMessage }),
+        body: JSON.stringify({
+          code: clampClientText(code, 3000),
+          errorMessage: clampClientText(errorMessage || "", 600),
+        }),
         timeoutMs: 45000,
         externalSignal: controller.signal,
       });
@@ -302,6 +430,7 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
       }
       const data = await res.json();
       if (res.ok && data.success) {
+        writePanelCache(cacheKey, data);
         setDebugResult(data);
       } else {
         setErrorText(data.error || "Cloud AI unavailable — showing on-device Python diagnoser.");
@@ -317,16 +446,15 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     }
   };
 
-  // Trigger Comment Addition
+  // Trigger Comment Addition (cached)
   const handleAddComments = async () => {
-    if (activeAbortRef.current) activeAbortRef.current.abort();
-    manualCancelRef.current = false;
-    const controller = new AbortController();
-    activeAbortRef.current = controller;
-    setLoading(true);
-    setErrorText(null);
-
     const buildOfflineComments = () => {
+      if (!code || !code.trim()) {
+        return {
+          commentedCode: "# Write Python code in the editor first",
+          summary: "Editor is currently empty — add Python code to annotate.",
+        };
+      }
       const lines = code.split("\n");
       const commented = lines
         .map((l) => (l.trim() && !l.trim().startsWith("#") ? `  # Step: ${l.trim().slice(0, 36)}\n${l}` : l))
@@ -337,17 +465,41 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
       };
     };
 
-    if (!navigator.onLine) {
+    if (!code || !code.trim()) {
+      setCommentResult(buildOfflineComments());
+      return;
+    }
+
+    const cacheKey = `comments|${code.trim()}`;
+    const cached = readPanelCache<AICommentResult>(cacheKey);
+    if (cached) {
+      setErrorText(null);
+      setCommentResult(cached);
+      return;
+    }
+
+    if (activeAbortRef.current) activeAbortRef.current.abort();
+    manualCancelRef.current = false;
+    const controller = new AbortController();
+    activeAbortRef.current = controller;
+    setLoading(true);
+    setErrorText(null);
+
+    if (!navigator.onLine || !canUseDailyCloudAi()) {
+      if (navigator.onLine && !canUseDailyCloudAi()) {
+        setErrorText("Daily Cloud AI limit reached — showing local structural comments.");
+      }
       setCommentResult(buildOfflineComments());
       setLoading(false);
       return;
     }
 
     try {
+      recordCloudAiCall();
       const res = await fetchWithTimeout(getApiUrl("/api/ai/add-comments"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
+        body: JSON.stringify({ code: clampClientText(code, 3000) }),
         timeoutMs: 45000,
         externalSignal: controller.signal,
       });
@@ -357,6 +509,7 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
       }
       const data = await res.json();
       if (res.ok && data.success) {
+        writePanelCache(cacheKey, data);
         setCommentResult(data);
       } else {
         setErrorText(data.error || "Cloud AI unavailable — showing offline structural comments.");
@@ -372,8 +525,25 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     }
   };
 
-  // Trigger Code Explanation
+  // Trigger Code Explanation (cached)
   const handleExplain = async () => {
+    if (!code || !code.trim()) {
+      setExplainResult({
+        summary: "Write or paste Python code in the editor first to get a line-by-line breakdown.",
+        steps: ["Open any lesson or type code in the playground editor."],
+        concepts: ["Python Basics"],
+      });
+      return;
+    }
+
+    const cacheKey = `explain|${code.trim()}`;
+    const cached = readPanelCache<AIExplainResult>(cacheKey);
+    if (cached) {
+      setErrorText(null);
+      setExplainResult(cached);
+      return;
+    }
+
     if (activeAbortRef.current) activeAbortRef.current.abort();
     manualCancelRef.current = false;
     const controller = new AbortController();
@@ -381,17 +551,21 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     setLoading(true);
     setErrorText(null);
 
-    if (!navigator.onLine) {
+    if (!navigator.onLine || !canUseDailyCloudAi()) {
+      if (navigator.onLine && !canUseDailyCloudAi()) {
+        setErrorText("Daily Cloud AI limit reached — showing built-in code breakdown.");
+      }
       setExplainResult(explainOfflineCode(code));
       setLoading(false);
       return;
     }
 
     try {
+      recordCloudAiCall();
       const res = await fetchWithTimeout(getApiUrl("/api/ai/explain"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
+        body: JSON.stringify({ code: clampClientText(code, 3000) }),
         timeoutMs: 45000,
         externalSignal: controller.signal,
       });
@@ -401,6 +575,7 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
       }
       const data = await res.json();
       if (res.ok && data.success) {
+        writePanelCache(cacheKey, data);
         setExplainResult(data);
       } else {
         setErrorText(data.error || "Cloud AI unavailable — showing offline explanation.");
@@ -416,8 +591,34 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     }
   };
 
-  // Trigger Hint Generation
+  // Trigger Hint Generation (cached + free local starter hint if editor unchanged)
   const handleGetHint = async () => {
+    const trimmedCode = (code || "").trim();
+    const trimmedStarter = (lessonContext?.starterCode || "").trim();
+    if (
+      lessonContext?.title &&
+      (!trimmedCode || (trimmedStarter && trimmedCode === trimmedStarter))
+    ) {
+      const objHint = lessonContext.learningObjectives?.[0]
+        ? ` Focus first on: ${lessonContext.learningObjectives[0]}.`
+        : "";
+      setHintResult({
+        hint: `For "${lessonContext.title}", start by updating or running the starter code toward the task goal: ${
+          lessonContext.description || "check expected output carefully."
+        }${objHint}`,
+        conceptToReview: lessonContext.title,
+      });
+      return;
+    }
+
+    const cacheKey = `hint|${lessonContext?.title || ""}|${trimmedCode}`;
+    const cached = readPanelCache<{ hint: string; conceptToReview?: string }>(cacheKey);
+    if (cached) {
+      setErrorText(null);
+      setHintResult(cached);
+      return;
+    }
+
     if (activeAbortRef.current) activeAbortRef.current.abort();
     manualCancelRef.current = false;
     const controller = new AbortController();
@@ -425,7 +626,10 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     setLoading(true);
     setErrorText(null);
 
-    if (!navigator.onLine) {
+    if (!navigator.onLine || !canUseDailyCloudAi()) {
+      if (navigator.onLine && !canUseDailyCloudAi()) {
+        setErrorText("Daily Cloud AI limit reached — showing local lesson hint.");
+      }
       setHintResult({
         hint: `[Offline Hint] For ${lessonContext?.title || "this problem"}: Break the script into small steps. First, define the needed variables or inputs. Second, perform calculations with arithmetic/comparison operators. Third, use print() to verify intermediate values.`,
         conceptToReview: lessonContext?.title || "Python Basics",
@@ -435,6 +639,7 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     }
 
     try {
+      recordCloudAiCall();
       const res = await fetchWithTimeout(getApiUrl("/api/ai/hint"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -442,7 +647,7 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
           lessonTitle: lessonContext?.title,
           lessonDescription: lessonContext?.description,
           targetOutput: lessonContext?.expectedOutput,
-          currentCode: code,
+          currentCode: clampClientText(code, 2000),
         }),
         timeoutMs: 45000,
         externalSignal: controller.signal,
@@ -453,6 +658,7 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
       }
       const data = await res.json();
       if (res.ok && data.success) {
+        writePanelCache(cacheKey, data);
         setHintResult(data);
       } else {
         setErrorText(data.error || "Cloud AI unavailable — showing offline hint.");
@@ -478,18 +684,31 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     const userText = promptText.trim();
     if (!userText || loading) return;
 
+    const newMessages = [...chatMessages, { role: "user" as const, text: userText }];
+    setChatMessages(newMessages);
+    setChatInput("");
+    setErrorText(null);
+
+    // Zero-cost local short-circuit for pure conversational greetings / thanks
+    if (/^(hi|hello|hey|yo|sup|good morning|good afternoon|good evening|thanks|thank you|ok|okay)[!.?]*$/i.test(userText)) {
+      const greetingReply = lessonContext?.title
+        ? `Hey! Ready to help with **${lessonContext.title}**. Ask a question about this lesson or paste/run your code anytime.`
+        : "Hey! Ask me any Python question, share a bug, or ask what lesson to study next.";
+      const finalMessages = [...newMessages, { role: "model" as const, text: greetingReply }];
+      setChatMessages(finalMessages);
+      return;
+    }
+
     if (activeAbortRef.current) activeAbortRef.current.abort();
     manualCancelRef.current = false;
     const controller = new AbortController();
     activeAbortRef.current = controller;
-
-    const newMessages = [...chatMessages, { role: "user" as const, text: userText }];
-    setChatMessages(newMessages);
-    setChatInput("");
     setLoading(true);
-    setErrorText(null);
 
-    if (!navigator.onLine) {
+    if (!navigator.onLine || !canUseDailyCloudAi()) {
+      if (navigator.onLine && !canUseDailyCloudAi()) {
+        setErrorText("Daily Cloud AI limit reached — using on-device Python guide.");
+      }
       const offlineReply = getOfflineChatReply(userText, code, lessonContext);
       const finalMessages = [...newMessages, { role: "model" as const, text: offlineReply }];
       setChatMessages(finalMessages);
@@ -513,12 +732,17 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
     }
 
     try {
+      recordCloudAiCall();
+      const recentWindow = newMessages.slice(-6).map((m, idx, arr) => ({
+        role: m.role,
+        text: clampClientText(m.text, idx === arr.length - 1 ? 1200 : 750),
+      }));
       const res = await fetchWithTimeout(getApiUrl("/api/ai/chat"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          messages: newMessages.slice(-14),
-          code,
+          messages: recentWindow,
+          code: clampClientText(code, 2200),
           lessonContext,
         }),
         timeoutMs: 45000,
@@ -1304,14 +1528,25 @@ export const AIAssistPanel: React.FC<AIAssistPanelProps> = ({
                     </button>
                   </div>
                 ) : (
-                  <button
-                    type="button"
-                    onClick={handleDebug}
-                    className="w-full min-h-[44px] py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold flex items-center justify-center gap-2 cursor-pointer transition-colors"
-                  >
-                    <Bug className="w-4 h-4" />
-                    <span>Find Fix</span>
-                  </button>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleDebug(false)}
+                      className="flex-1 min-h-[44px] py-2 px-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold flex items-center justify-center gap-2 cursor-pointer transition-colors"
+                    >
+                      <Bug className="w-4 h-4" />
+                      <span>Find Fix</span>
+                    </button>
+                    {isStandardPythonError(errorMessage) && (
+                      <button
+                        type="button"
+                        onClick={() => handleDebug(true)}
+                        className="min-h-[44px] py-2 px-3 bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-800 dark:text-slate-100 rounded-lg font-semibold cursor-pointer transition-colors"
+                      >
+                        Ask Cloud AI
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
 

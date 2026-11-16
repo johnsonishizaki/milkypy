@@ -43,6 +43,8 @@ Module 7: 7. Functions & Reusable Blocks
   - 7.3 The return Statement (intermediate): Returning computed results with return vs printing with print(), saving returned values.
   - 7.4 Variable Scope & Functions Recap (intermediate): Local vs global scope and default parameter values (e.g. def greet(name='Friend'):).`;
 
+export const MILKY_CURRICULUM_COMPACT = `MilkyPy Modules: 1. Basics & Syntax (print, math, # comments), 2. Variables & Types (int/float/str/bool, casting), 3. Operators & F-Strings (comparisons, and/or/not, f"..."), 4. Conditions (if/elif/else), 5. Loops (while, for, range, break/continue), 6. Collections (lists, methods, dicts), 7. Functions (def, params, return, scope).`;
+
 export interface MilkyChatQuizContext {
   question: string;
   userChoice?: string;
@@ -61,61 +63,72 @@ export interface MilkyChatInstructionOptions {
     quizQuestion?: MilkyChatQuizContext;
   };
   customSystem?: string;
+  latestUserMessage?: string;
+}
+
+function clampText(text: string | undefined, maxChars: number): string {
+  const clean = (text || "").trim();
+  if (!clean || clean.length <= maxChars) return clean;
+  return `${clean.slice(0, maxChars)}\n... (truncated)`;
 }
 
 export function buildMilkyChatSystemInstruction(
   options: MilkyChatInstructionOptions
 ): string {
   if (options.customSystem && options.customSystem.trim()) {
-    return `${options.customSystem.trim()}\n\nFormatting rules: Never use emojis or decorative Unicode icons. Give complete, thorough responses without cutting off.`;
+    return `${clampText(options.customSystem, 1000)}\n\nRules: Be concise. Never use emojis. Return complete code blocks.`;
   }
 
-  const trimmedCode = (options.code || "").trim();
+  const query = (options.latestUserMessage || "").toLowerCase();
+  const wantsSyllabus =
+    !query ||
+    /\b(curriculum|syllabus|module|modules|lesson|lessons|roadmap|course|next|topic|topics|study|learn next|start)\b/.test(
+      query
+    );
+
+  const trimmedCode = clampText(options.code, 2200);
   const qCtx = options.lessonContext?.quizQuestion;
   const quizBlock = qCtx
-    ? `\nACTIVE QUIZ QUESTION HELP CONTEXT:
-- Question: ${qCtx.question}${
+    ? `\nQUIZ CONTEXT:
+- Q: ${clampText(qCtx.question, 300)}${
         qCtx.userChoice !== undefined
-          ? `\n- Student Selected: ${qCtx.userChoice} (${qCtx.isCorrect ? "Correct" : "Incorrect"})`
+          ? `\n- Picked: ${clampText(qCtx.userChoice, 120)} (${qCtx.isCorrect ? "Correct" : "Wrong"})`
           : ""
       }
-- Correct Answer: ${qCtx.correctAnswer}${
-        qCtx.explanation ? `\n- Concept Note: ${qCtx.explanation}` : ""
+- Answer: ${clampText(qCtx.correctAnswer, 120)}${
+        qCtx.explanation ? `\n- Note: ${clampText(qCtx.explanation, 280)}` : ""
       }`
     : "";
 
   const lessonBlock = options.lessonContext?.title
-    ? `\nACTIVE LESSON CONTEXT:\n- Title: ${options.lessonContext.title}${
+    ? `\nLESSON: ${clampText(options.lessonContext.title, 120)}${
         options.lessonContext.description
-          ? `\n- Description: ${options.lessonContext.description}`
+          ? ` — ${clampText(options.lessonContext.description, 260)}`
           : ""
       }${
         options.lessonContext.expectedOutput
-          ? `\n- Expected Output: ${options.lessonContext.expectedOutput}`
+          ? `\nTarget output: ${clampText(options.lessonContext.expectedOutput, 180)}`
           : ""
       }${
         options.lessonContext.learningObjectives?.length
-          ? `\n- Objectives: ${options.lessonContext.learningObjectives.join("; ")}`
+          ? `\nObjectives: ${options.lessonContext.learningObjectives.slice(0, 4).join("; ")}`
           : ""
       }`
     : "";
 
-  const fullLessonContext = `${lessonBlock}${quizBlock}`;
+  const curriculumBlock = wantsSyllabus
+    ? `\n${MILKY_CURRICULUM_OUTLINE}`
+    : `\n${MILKY_CURRICULUM_COMPACT}`;
 
   const codeBlock = trimmedCode
-    ? `\nOPTIONAL WORKSPACE CODE (reference this ONLY when the user asks about their script, debugging, or improving it—ignore it for general or unrelated questions):\n\`\`\`python\n${trimmedCode}\n\`\`\``
+    ? `\nUSER CODE (only reference if relevant):\n\`\`\`python\n${trimmedCode}\n\`\`\``
     : "";
 
-  return `You are Milky, a capable, natural, and helpful general-purpose AI assistant who can answer and help with anything (general knowledge, writing, math, science, brainstorming, web/software topics, everyday questions, and conversation), while specializing deeply in Python programming and teaching.
-
-HOW TO RESPOND:
-1. Be natural and direct: Answer whatever the user actually asks. If they ask a non-Python or general question, answer it directly as a normal intelligent chatbot without forcing Python analogies or bringing up their editor code.
-2. Excel at Python & teaching: When the user asks about Python, coding, debugging, or learning, give clear, accurate, well-structured explanations and clean, runnable code examples. Adapt to their request—be crisp for quick questions, or step-by-step and encouraging with mini-practice tasks when they want to learn.
-3. Teach the MilkyPy curriculum: You know the full MilkyPy curriculum below. When a user asks what to learn next, wants to study a module/lesson, or asks you to teach them Python from the course, teach directly from this syllabus, cite the exact module/lesson number and title, walk through concepts interactively, and suggest practice exercises aligned with the lesson goals.
-4. No emojis: Never use emojis, emoticons, or decorative Unicode symbols anywhere in your responses unless the user explicitly asks for them.
-5. Complete answers: Write complete explanations and complete code blocks without cutting off or leaving placeholders. If suggesting a replacement script for the user's workspace, include the full updated code inside a single \`\`\`python block.
-
-${MILKY_CURRICULUM_OUTLINE}${fullLessonContext}${codeBlock}`;
+  return `You are Milky, a concise Python tutor and general assistant.
+Rules:
+1. Answer what the user asked directly and briefly (skip filler). If non-Python, answer normally without forcing code.
+2. For Python/lesson questions, give clear steps and clean runnable code. Reference MilkyPy lessons when helpful.
+3. Never use emojis. Never cut off code blocks mid-way.${curriculumBlock}${lessonBlock}${quizBlock}${codeBlock}`;
 }
 
 /**
